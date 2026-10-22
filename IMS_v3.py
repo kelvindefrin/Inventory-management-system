@@ -184,6 +184,12 @@ class Database:
         c.execute("""CREATE TABLE IF NOT EXISTS expenses (
                    id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT NOT NULL,
                    amount REAL NOT NULL, ts TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS customers (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                   phone TEXT NOT NULL, created_at TEXT NOT NULL)""")
+        order_cols = {r[1] for r in c.execute("PRAGMA table_info(orders)")}
+        if "customer_id" not in order_cols:
+            c.execute("ALTER TABLE orders ADD COLUMN customer_id INTEGER")
         c.commit()
 
     # -- settings ---------------------------------------------------------
@@ -241,7 +247,7 @@ class Database:
             "SELECT * FROM movements WHERE item_id=? ORDER BY id DESC LIMIT ?",
             (item_id, limit)).fetchall()
 
-    def checkout(self, cart):
+    def checkout(self, cart, customer_id=None):
         """Record a sale and decrement its inventory atomically."""
         if not cart:
             raise ValueError("Add at least one item to the bill.")
@@ -260,7 +266,10 @@ class Database:
                 line_total = round(quantity * item["price"], 2)
                 total += line_total
                 lines.append((item, quantity, line_total))
-            cur = c.execute("INSERT INTO orders (ts,total,status) VALUES (?,?,?)", (now(), round(total, 2), "Completed"))
+            if customer_id is not None and c.execute("SELECT 1 FROM customers WHERE id=?", (customer_id,)).fetchone() is None:
+                raise ValueError("The selected customer no longer exists.")
+            cur = c.execute("INSERT INTO orders (ts,total,status,customer_id) VALUES (?,?,?,?)",
+                            (now(), round(total, 2), "Completed", customer_id))
             order_id = cur.lastrowid
             for item, quantity, line_total in lines:
                 new_qty = item["quantity"] - quantity
@@ -273,6 +282,27 @@ class Database:
         except Exception:
             c.rollback()
             raise
+
+    def create_customer(self, name, phone):
+        cur = self.conn.execute("INSERT INTO customers (name,phone,created_at) VALUES (?,?,?)",
+                                (name, phone, now()))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def customers(self, search=""):
+        sql = """SELECT c.id,c.name,c.phone,c.created_at,COUNT(o.id) AS orders,
+                 COALESCE(SUM(CASE WHEN o.status='Completed' THEN o.total ELSE 0 END),0) AS spent,
+                 MAX(o.ts) AS last_order
+                 FROM customers c LEFT JOIN orders o ON o.customer_id=c.id"""
+        args = []
+        if search:
+            sql += " WHERE c.name LIKE ? OR c.phone LIKE ? OR CAST(c.id AS TEXT) LIKE ?"
+            args = [f"%{search}%"] * 3
+        sql += " GROUP BY c.id ORDER BY c.id DESC"
+        return self.conn.execute(sql, args).fetchall()
+
+    def get_customer(self, customer_id):
+        return self.conn.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
 
     def add_expense(self, description, amount):
         self.conn.execute("INSERT INTO expenses (description,amount,ts) VALUES (?,?,?)",
@@ -701,7 +731,8 @@ class HistoryDialog(Dialog):
 # Main window
 # --------------------------------------------------------------------------
 class App(tk.Tk):
-    NAV = (("dashboard", "Dashboard", "\u2302"), ("billing", "Billing", "\u25A4"), ("items", "Items", "\u25A3"),
+    NAV = (("dashboard", "Dashboard", "\u2302"), ("billing", "Billing", "\u25A4"),
+           ("customers", "Customers", "\u263A"), ("items", "Items", "\u25A3"),
            ("reports", "Reports", "\u25A5"), ("tools", "Tools", "\u2692"),
            ("settings", "Settings", "\u2699"), ("help", "Help", "?"))
 
@@ -723,6 +754,7 @@ class App(tk.Tk):
             SCALE = 1.0
         self.db = db
         self.currency = db.get_setting("currency", "Rs. ")
+        self.customer_required = db.get_setting("customer_required", "0") == "1"
         try:
             self.default_min = int(db.get_setting("default_min", "5"))
         except ValueError:
@@ -740,8 +772,10 @@ class App(tk.Tk):
         self.checked = set()
         self.page = "dashboard"
         self.bill_cart = {}
+        self.bill_selected_customer = None
         self.report_kind = "low"
         self.tree = self.rep_tree = self.search_box = None
+        self.bill_customer_box = self.customer_tree = None
         self.card_vars = None
         self._page_refresh = None
         self._row_tags, self._sel_prev = {}, None
@@ -948,6 +982,8 @@ class App(tk.Tk):
             pass
 
     def show_page(self, key):
+        if self.page == "billing" and getattr(self, "bill_customer_box", None):
+            self.bill_selected_customer = self.bill_customer_ids.get(self.bill_customer.get())
         self.page = key
         for w in self.content.winfo_children():
             w.destroy()
@@ -1073,6 +1109,18 @@ class App(tk.Tk):
         right.pack(side="right", fill="both", expand=True)
         bar = tk.Frame(left, bg=THEME["bg"])
         bar.pack(fill="x", pady=(0, px(10)))
+        customer_bar = tk.Frame(left, bg=THEME["bg"])
+        customer_bar.pack(fill="x", pady=(0, px(8)))
+        customer_label = "Customer (required)" if self.customer_required else "Customer (optional)"
+        tk.Label(customer_bar, text=customer_label, font=(FONT, 9, "bold"), bg=THEME["bg"], fg=THEME["text"]).pack(side="left", padx=(0, px(8)))
+        self.bill_customer = tk.StringVar()
+        self.bill_customer_ids = {}
+        self.bill_customer_box = ttk.Combobox(customer_bar, textvariable=self.bill_customer, state="readonly")
+        self.bill_customer_box.pack(side="left", fill="x", expand=True)
+        self.bill_customer_box.bind("<<ComboboxSelected>>", lambda e: setattr(
+            self, "bill_selected_customer", self.bill_customer_ids.get(self.bill_customer.get())))
+        self._fill_bill_customers()
+        FlatButton(customer_bar, "Create customer", lambda: self.show_page("customers")).pack(side="left", padx=(px(8), 0))
         self.bill_search = tk.StringVar()
         ent = ttk.Entry(bar, textvariable=self.bill_search)
         ent.pack(side="left", fill="x", expand=True)
@@ -1133,13 +1181,106 @@ class App(tk.Tk):
     def _bill_checkout(self):
         if not self.bill_cart:
             messagebox.showinfo("Checkout", "Add items to the bill first.", parent=self); return
+        customer_id = self.bill_customer_ids.get(self.bill_customer.get()) if getattr(self, "bill_customer", None) else None
+        if self.customer_required and customer_id is None:
+            messagebox.showwarning("Customer required", "Select a customer before completing this sale.", parent=self); return
         if not messagebox.askyesno("Checkout", f"Complete this sale for {self.bill_total.get()}?", parent=self): return
         try:
-            order_id, total = self.db.checkout(self.bill_cart)
+            order_id, total = self.db.checkout(self.bill_cart, customer_id)
         except (ValueError, sqlite3.Error) as exc:
             messagebox.showerror("Checkout failed", str(exc), parent=self); return
         self.bill_cart.clear(); self._draw_bill(); self._fill_bill_items(); self.refresh()
         messagebox.showinfo("Sale complete", f"Order #{order_id} recorded. Total: {self.money(total)}", parent=self)
+
+    def _fill_bill_customers(self):
+        if not getattr(self, "bill_customer_box", None):
+            return
+        selected = self.bill_customer.get()
+        rows = self.db.customers()
+        labels = [f"CUS-{r['id']:06d} · {r['name']} · {r['phone']}" for r in rows]
+        self.bill_customer_ids = {label: row["id"] for label, row in zip(labels, rows)}
+        self.bill_customer_box.configure(values=labels)
+        if selected in self.bill_customer_ids:
+            self.bill_customer.set(selected)
+        elif self.bill_selected_customer in self.bill_customer_ids.values():
+            self.bill_customer.set(next(label for label, cid in self.bill_customer_ids.items()
+                                        if cid == self.bill_selected_customer))
+        else:
+            self.bill_customer.set("")
+
+    def _page_customers(self, p):
+        self._title(p, "Customers", "Create customer profiles and track their orders and lifetime spend.")
+        setting = tk.Frame(p, bg=THEME["bg"])
+        setting.pack(fill="x", pady=(0, px(12)))
+        self.v_customer_required = tk.BooleanVar(value=self.customer_required)
+        ttk.Checkbutton(setting, text="Customer details required at billing checkout",
+                        variable=self.v_customer_required, command=self._save_customer_required).pack(side="left")
+        card = self._card(p)
+        card.pack(fill="x", pady=(0, px(12)))
+        form = ttk.Frame(card, style="Card.TFrame", padding=14)
+        form.pack(fill="x")
+        self.customer_name_var = tk.StringVar()
+        self.customer_phone_var = tk.StringVar()
+        ttk.Label(form, text="Customer name", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(form, textvariable=self.customer_name_var, width=28).grid(row=0, column=1, padx=(0, 16))
+        ttk.Label(form, text="Phone number", style="Card.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 8))
+        ttk.Entry(form, textvariable=self.customer_phone_var, width=22).grid(row=0, column=3, padx=(0, 14))
+        FlatButton(form, "Create customer", self._create_customer, "primary").grid(row=0, column=4)
+
+        tools = tk.Frame(p, bg=THEME["bg"])
+        tools.pack(fill="x", pady=(0, px(8)))
+        self.customer_search = tk.StringVar()
+        customer_search_entry = ttk.Entry(tools, textvariable=self.customer_search)
+        customer_search_entry.pack(side="left", fill="x", expand=True)
+        self.customer_search.set("")
+        customer_search_entry.bind("<KeyRelease>", lambda e: self._refresh_customers())
+        tk.Label(tools, text="Customer ID is assigned automatically and stays linked to their orders.",
+                 font=(FONT, 9), bg=THEME["bg"], fg=THEME["muted"]).pack(side="right", padx=(px(12), 0))
+        table_card = self._card(p)
+        table_card.pack(fill="both", expand=True)
+        columns = (("id", "Customer ID", 115), ("name", "Name", 190), ("phone", "Phone", 140),
+                   ("orders", "Orders", 85), ("spent", "Lifetime spend", 135), ("last", "Last order", 155))
+        self.customer_tree = ttk.Treeview(table_card, columns=[c[0] for c in columns], show="headings")
+        for col, label, width in columns:
+            self.customer_tree.heading(col, text=label)
+            self.customer_tree.column(col, width=px(width), anchor="e" if col in ("orders", "spent") else "w")
+        self.customer_tree.pack(fill="both", expand=True, padx=px(8), pady=px(8))
+        self._refresh_customers()
+
+    def _save_customer_required(self):
+        self.customer_required = self.v_customer_required.get()
+        self.db.set_setting("customer_required", "1" if self.customer_required else "0")
+
+    def _create_customer(self):
+        name = self.customer_name_var.get().strip()
+        phone = self.customer_phone_var.get().strip()
+        if not name:
+            messagebox.showwarning("Check customer", "Enter the customer's name.", parent=self); return
+        digits = sum(ch.isdigit() for ch in phone)
+        if digits < 7:
+            messagebox.showwarning("Check customer", "Enter a valid phone number with at least 7 digits.", parent=self); return
+        try:
+            customer_id = self.db.create_customer(name, phone)
+        except sqlite3.Error as exc:
+            messagebox.showerror("Could not create customer", str(exc), parent=self); return
+        self.customer_name_var.set(""); self.customer_phone_var.set("")
+        self._refresh_customers()
+        if getattr(self, "bill_customer_box", None):
+            self._fill_bill_customers()
+            for label, cid in self.bill_customer_ids.items():
+                if cid == customer_id:
+                    self.bill_customer.set(label); break
+        self.bill_selected_customer = customer_id
+        messagebox.showinfo("Customer created", f"Customer ID: CUS-{customer_id:06d}", parent=self)
+
+    def _refresh_customers(self):
+        if not getattr(self, "customer_tree", None):
+            return
+        self.customer_tree.delete(*self.customer_tree.get_children())
+        for row in self.db.customers(self.customer_search.get().strip()):
+            self.customer_tree.insert("", "end", iid=str(row["id"]), values=(
+                f"CUS-{row['id']:06d}", row["name"], row["phone"], row["orders"],
+                self.money(row["spent"]), row["last_order"] or "—"))
 
     def _expense_dialog(self):
         win = tk.Toplevel(self); win.title("Record expense"); win.transient(self); win.grab_set()
